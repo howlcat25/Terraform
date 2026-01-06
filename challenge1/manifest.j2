@@ -1,0 +1,165 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: {{ vm_name }}
+  namespace: {{ vm_namespace }}
+  labels:
+    app: {{ image }}
+    os: {{ image_type }}
+    name: {{ vm_name }}
+spec:
+  dataVolumeTemplates:
+    - metadata:
+        name: {{ vm_name }}-volume
+      spec:
+        sourceRef:
+          kind: DataSource
+          name: {{ image }}
+          namespace: openshift-virtualization-os-images
+        storage:
+          resources:
+            requests:
+              storage: {{ os_disk_size }}Gi
+          storageClassName: powerstore
+
+  {% if image_type == 'linux' %}
+  instancetype:
+    kind: VirtualMachineInstancetype
+    name: {{ cpu_size }}cpu{{ memory_size }}g
+  runStrategy: Always
+  {% else %}
+  runStrategy: RerunOnFailure
+  {% endif %}
+
+  template:
+    metadata:
+      labels:
+        network.kubevirt.io/headlessService: headless
+    spec:
+
+      {% if image_type == 'linux' %}
+      accessCredentials:
+        - sshPublicKey:
+            source:
+              secret:
+                secretName: "my-ssh-public-key"
+            propagationMethod:
+              noCloud: {}
+      {% endif %}
+
+      {% if image_type == 'windows' %}
+      architecture: amd64
+      {% endif %}
+
+      domain:
+
+        {% if image_type == 'windows' %}
+        cpu:
+          sockets: {{ cpu_size }}
+          cores: 1
+          threads: 1
+
+        memory:
+          guest: {{ memory_size }}Gi
+        {% endif %}
+
+        devices:
+          disks:
+
+            {% if image_type == 'windows' %}
+            - name: rootdisk
+              disk:
+                bus: sata
+
+            - name: windows-drivers-disk
+              cdrom:
+                bus: sata
+            {% else %}
+            - name: rootdisk
+              disk:
+                bus: virtio
+            {% endif %}
+
+          interfaces:
+            - masquerade: {}
+              name: default
+              model: {% if image_type == 'windows' %}e1000e{% else %}virtio{% endif %}
+
+            - bridge: {}
+              name: {{ secondary_network_name }}
+              state: up
+              model: {% if image_type == 'windows' %}e1000e{% else %}virtio{% endif %}
+
+        {% if image_type == 'windows' %}
+        features:
+          smm: {}
+
+        firmware:
+          bootloader:
+            efi:
+              persistent: true
+              secureBoot: true
+
+        machine:
+          type: pc-q35-rhel9.6.0
+        {% endif %}
+
+      networks:
+        - name: default
+          pod: {}
+        - name: nic-bronze-caribou-15
+          multus:
+            networkName: nad-vlan-vm
+
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: {{ vm_name }}-volume
+
+        {% if image_type == 'windows' %}
+        - name: windows-drivers-disk
+          containerDisk:
+            image: "registry.redhat.io/container-native-virtualization/virtio-win-rhel9@sha256:c0ac80f1223be7d1c18f88631fba0c215d97431c232d5f61ffe629ec444f9708"
+        {% endif %}
+
+        {% if image_type == 'linux' %}
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+
+            {% if bootproto == 'static' %}
+            networkData: |
+              version: 2
+              ethernets:
+                eth1:
+                  addresses:
+                    - {{ static_ip_address }}
+                  gateway4: {{ gateway }}
+                  nameservers:
+                    addresses: {{ nameserver }}
+                  {% if search_domain | default('') | trim != '' %}
+                    search: {{ search_domain }}
+                  {% endif %}
+
+            {% elif bootproto == 'dhcp' and image == 'ubuntu' %}
+            networkData: |
+              version: 2
+              ethernets:
+                enp2s0:
+                  dhcp4: true
+            {% endif %}
+
+            userData: |
+              #cloud-config
+              chpasswd:
+                expire: false
+              user: {{ login_user_name }}
+              password: {{ login_password }}
+              ssh_pwauth: true
+
+              {% if image == 'ubuntu' %}
+              runcmd:
+                - echo "deb [trusted=yes] http://10.255.88.199/repo/qemu-agent/ ./" | sudo tee /etc/apt/sources.list.d/local-qemu.list
+                - sudo apt update
+                - sudo apt install -y qemu-guest-agent && sudo systemctl enable --now qemu-guest-agent
+              {% endif %}
+        {% endif %}
